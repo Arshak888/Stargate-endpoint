@@ -7,8 +7,11 @@ import (
 	"github.com/Arshak888/Stargate-endpoint/internal/config"
 	"github.com/Arshak888/Stargate-endpoint/internal/manager"
 	"github.com/Arshak888/Stargate-endpoint/internal/protocol"
+	stargateruntime "github.com/Arshak888/Stargate-endpoint/internal/runtime"
 	"github.com/Arshak888/Stargate-endpoint/internal/state"
 )
+
+const defaultHeartbeatInterval = 30 * time.Second
 
 func main() {
 	cfg := config.Load()
@@ -16,6 +19,7 @@ func main() {
 		log.Fatal("STARGATE_MANAGER_URL is required")
 	}
 
+	rt := stargateruntime.NewLocal("/")
 	s, err := state.Load(cfg.ConfigPath)
 	if err != nil {
 		if cfg.EnrollmentID == "" || cfg.EnrollmentToken == "" {
@@ -40,13 +44,13 @@ func main() {
 			EndpointID:      result.EndpointID,
 			Credential:      result.EndpointCredential,
 			ManagerURL:      cfg.ManagerURL,
-			Name:           cfg.EndpointName,
+			Name:            cfg.EndpointName,
 			Region:          cfg.Region,
 			Country:         cfg.Country,
 			City:            cfg.City,
 			ProtocolVersion: result.ProtocolVersion,
 			Version:         cfg.Version,
-			Capabilities:    []string{},
+			Capabilities:    rt.Capabilities(),
 		}
 		if err := state.Save(cfg.ConfigPath, s); err != nil {
 			log.Fatalf("save endpoint state: %v", err)
@@ -54,19 +58,50 @@ func main() {
 		log.Printf("endpoint enrolled: %s", s.EndpointID)
 	}
 
+	if s.ManagerURL == "" {
+		s.ManagerURL = cfg.ManagerURL
+	}
+	if s.Version == "" {
+		s.Version = cfg.Version
+	}
+	if len(s.Capabilities) == 0 {
+		s.Capabilities = rt.Capabilities()
+		if err := state.Save(cfg.ConfigPath, s); err != nil {
+			log.Fatalf("save endpoint capabilities: %v", err)
+		}
+	}
+
 	client := manager.NewClient(s.ManagerURL, s.Credential)
-	ticker := time.NewTicker(30 * time.Second)
+	interval := defaultHeartbeatInterval
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	sendHeartbeat := func() {
+		snapshot, err := rt.Snapshot()
+		if err != nil {
+			log.Printf("runtime metrics unavailable: %v", err)
+			snapshot = stargateruntime.Snapshot{}
+		}
+
 		result, err := client.Heartbeat(protocol.HeartbeatRequest{
 			EndpointID:     s.EndpointID,
 			Version:        s.Version,
 			Capabilities:   s.Capabilities,
+			CPUPercent:     snapshot.CPUPercent,
+			MemoryPercent:  snapshot.MemoryPercent,
+			DiskPercent:    snapshot.DiskPercent,
+			ActiveSessions: snapshot.ActiveSessions,
 		})
 		if err != nil {
 			log.Printf("heartbeat failed: %v", err)
 			return
+		}
+		if result.HeartbeatIntervalSecs > 0 {
+			next := time.Duration(result.HeartbeatIntervalSecs) * time.Second
+			if next != interval {
+				interval = next
+				ticker.Reset(interval)
+			}
 		}
 		log.Printf("heartbeat acknowledged at %s", result.ObservedAt)
 	}
